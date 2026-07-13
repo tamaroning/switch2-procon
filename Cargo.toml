@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["crates/switch2-procon", "crates/switch2-procon-app"]
+default-members = ["crates/switch2-procon-app"]
+
+[workspace.package]
+version = "0.1.0"
