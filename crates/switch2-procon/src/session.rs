@@ -1,5 +1,6 @@
 //! BLE session worker: scan, connect, input + rumble loop.
 
+use crate::ble_latency::LowLatencyHold;
 use crate::input::{ControllerState, INPUT_CHAR_UUID};
 use crate::output::{GamepadOutput, RumbleMotors, VigemStatus, create_output};
 use crate::rumble::{self, RUMBLE_CHAR_UUID};
@@ -12,7 +13,7 @@ use btleplug::platform::{Adapter, Manager, Peripheral, PeripheralId};
 use futures::{FutureExt, StreamExt};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{self, MissedTickBehavior};
@@ -58,6 +59,10 @@ pub struct AppState {
     pub live: ControllerState,
     pub vigem: VigemStatus,
     pub last_error: Option<String>,
+    /// Negotiated BLE connection interval in milliseconds (Windows 11+).
+    pub ble_interval_ms: Option<f32>,
+    /// Input notification rate estimated over the last second.
+    pub input_hz: Option<f32>,
 }
 
 impl Default for AppState {
@@ -69,6 +74,8 @@ impl Default for AppState {
             live: ControllerState::default(),
             vigem: VigemStatus::Unsupported,
             last_error: None,
+            ble_interval_ms: None,
+            input_hz: None,
         }
     }
 }
@@ -269,6 +276,12 @@ async fn run_input_loop(
 
     let mut last = ControllerState::default();
     let mut notifications = controller.notifications().await?;
+    let mut rate_window = Instant::now();
+    let mut rate_count: u32 = 0;
+    let mut params_tick = time::interval(Duration::from_secs(2));
+    params_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // Skip the immediate first tick so we don't race the low-latency request.
+    params_tick.tick().await;
 
     loop {
         tokio::select! {
@@ -276,6 +289,14 @@ async fn run_input_loop(
             _ = cancel.changed() => {
                 if *cancel.borrow() {
                     break;
+                }
+            }
+            _ = params_tick.tick() => {
+                if let Ok(Some(params)) = controller.connection_parameters().await {
+                    let ms = params.interval_us as f32 / 1000.0;
+                    if let Ok(mut s) = state.lock() {
+                        s.ble_interval_ms = Some(ms);
+                    }
                 }
             }
             data = notifications.next() => {
@@ -304,6 +325,16 @@ async fn run_input_loop(
                         }
                         continue;
                     };
+                    rate_count = rate_count.saturating_add(1);
+                    let elapsed = rate_window.elapsed();
+                    if elapsed >= Duration::from_secs(1) {
+                        let hz = rate_count as f32 / elapsed.as_secs_f32();
+                        rate_count = 0;
+                        rate_window = Instant::now();
+                        if let Ok(mut s) = state.lock() {
+                            s.input_hz = Some(hz);
+                        }
+                    }
                     if significant_change(&last, &parsed) {
                         last = parsed;
                         if let Ok(mut s) = state.lock() {
@@ -371,6 +402,15 @@ async fn connect_and_run(
         .await
         .context("discover_services failed")?;
 
+    // Prefer a short connection interval. Hold the WinRT request for the session
+    // so Windows does not revert to Balanced as soon as the handle is dropped.
+    let addr_u64 = peripheral.address().into();
+    let (low_latency_hold, initial_interval_ms) = LowLatencyHold::acquire(addr_u64).await;
+    if let Ok(mut s) = state.lock() {
+        s.ble_interval_ms = initial_interval_ms;
+        s.input_hz = None;
+    }
+
     let input_uuid = Uuid::parse_str(INPUT_CHAR_UUID)?;
     let rumble_uuid = Uuid::parse_str(RUMBLE_CHAR_UUID)?;
     let mut input_char: Option<Characteristic> = None;
@@ -427,9 +467,12 @@ async fn connect_and_run(
     )
     .await;
 
+    drop(low_latency_hold);
     let _ = peripheral.disconnect().await;
     if let Ok(mut s) = state.lock() {
         s.live = ControllerState::default();
+        s.ble_interval_ms = None;
+        s.input_hz = None;
         if s.phase == ConnectionPhase::Active {
             s.phase = ConnectionPhase::Idle;
         }
@@ -641,6 +684,8 @@ async fn session_worker(
                 set_phase(&state, ConnectionPhase::Idle);
                 if let Ok(mut s) = state.lock() {
                     s.live = ControllerState::default();
+                    s.ble_interval_ms = None;
+                    s.input_hz = None;
                 }
                 // Resume scanning so the next advertisement auto-connects again.
                 let _ = cmd_tx.send(Command::StartScan);

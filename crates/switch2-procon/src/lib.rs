@@ -1,3 +1,4 @@
+pub mod ble_latency;
 pub mod input;
 pub mod output;
 pub mod rumble;

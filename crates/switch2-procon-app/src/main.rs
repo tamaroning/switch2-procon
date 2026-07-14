@@ -326,6 +326,20 @@ impl eframe::App for UiApp {
             ui.add_space(10.0);
             ui.separator();
             ui.label("Live input");
+            if state.phase == ConnectionPhase::Active {
+                ui.horizontal(|ui| {
+                    let interval = state
+                        .ble_interval_ms
+                        .map(|ms| format!("{ms:.1} ms"))
+                        .unwrap_or_else(|| "—".into());
+                    let hz = state
+                        .input_hz
+                        .map(|h| format!("{h:.0} Hz"))
+                        .unwrap_or_else(|| "—".into());
+                    ui.colored_label(MUTED, format!("BLE interval: {interval}"));
+                    ui.colored_label(MUTED, format!("Input: {hz}"));
+                });
+            }
             // Stick/counter only here; buttons have their own fixed row below.
             ui.monospace(format!(
                 "#{:<3} L({:+.2},{:+.2}) R({:+.2},{:+.2})",
