@@ -1,5 +1,8 @@
 //! GUI for switch2-procon.
 
+// Hide the console window for release builds (double-clicked .exe).
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2, ViewportCommand};
 use notify_rust::Notification;
 use std::sync::Arc;
