@@ -7,11 +7,12 @@ use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2, ViewportComma
 use notify_rust::Notification;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver};
 use switch2_procon::{
     AppState, Command, ConnectionPhase, SessionHandle, Stick, VigemStatus, format_buttons,
     format_xinput,
 };
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 const VIGEM_URL: &str = VigemStatus::RELEASES_URL;
@@ -104,9 +105,10 @@ struct UiApp {
     auto_connect_done: bool,
     auto_addr: Option<String>,
     tray: Option<TrayIcon>,
-    menu_show: MenuItem,
-    menu_disconnect: MenuItem,
-    menu_quit: MenuItem,
+    menu_show_id: MenuId,
+    menu_disconnect_id: MenuId,
+    tray_rx: Receiver<TrayIconEvent>,
+    menu_rx: Receiver<MenuEvent>,
     window_visible: Arc<AtomicBool>,
     last_phase: ConnectionPhase,
     last_error: Option<String>,
@@ -120,20 +122,65 @@ impl UiApp {
         let menu_show = MenuItem::new("Show", true, None);
         let menu_disconnect = MenuItem::new("Disconnect", true, None);
         let menu_quit = MenuItem::new("Quit", true, None);
+        let menu_show_id = menu_show.id().clone();
+        let menu_disconnect_id = menu_disconnect.id().clone();
+        let menu_quit_id = menu_quit.id().clone();
         let tray_menu = Menu::new();
         let _ = tray_menu.append(&menu_show);
         let _ = tray_menu.append(&menu_disconnect);
         let _ = tray_menu.append(&PredefinedMenuItem::separator());
         let _ = tray_menu.append(&menu_quit);
 
+        let window_visible = Arc::new(AtomicBool::new(true));
+
+        // Handle tray/menu on the event callback itself. Relying only on poll_tray
+        // fails when the window is visible: TrackPopupMenu nests a modal loop and
+        // Quit may never be processed until later (or never, if focus races).
+        let (tray_tx, tray_rx) = mpsc::channel();
+        let (menu_tx, menu_rx) = mpsc::channel();
+        {
+            let ctx = cc.egui_ctx.clone();
+            TrayIconEvent::set_event_handler(Some(move |event| {
+                let _ = tray_tx.send(event);
+                ctx.request_repaint();
+            }));
+        }
+        {
+            let ctx = cc.egui_ctx.clone();
+            let cmd_tx = session.cmd_tx.clone();
+            let window_visible = window_visible.clone();
+            let show_id = menu_show_id.clone();
+            let disconnect_id = menu_disconnect_id.clone();
+            MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+                if event.id == menu_quit_id {
+                    let _ = cmd_tx.send(Command::Quit);
+                    // Exit here — don't wait for egui to poll. TrayIcon isn't
+                    // Send so we can't drop it from this callback; process exit
+                    // tears everything down.
+                    std::process::exit(0);
+                }
+                if event.id == disconnect_id {
+                    let _ = cmd_tx.send(Command::Disconnect);
+                } else if event.id == show_id {
+                    window_visible.store(true, Ordering::SeqCst);
+                    ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(ViewportCommand::Focus);
+                }
+                let _ = menu_tx.send(event);
+                ctx.request_repaint();
+            }));
+        }
+
+        // Left click = show window; right click = context menu (default was both).
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(tray_menu))
             .with_tooltip("switch2-procon")
             .with_icon(make_tray_icon())
+            .with_menu_on_left_click(false)
             .build()
             .ok();
 
-        let window_visible = Arc::new(AtomicBool::new(true));
         apply_theme(&cc.egui_ctx);
 
         Self {
@@ -141,9 +188,10 @@ impl UiApp {
             auto_connect_done: false,
             auto_addr,
             tray,
-            menu_show,
-            menu_disconnect,
-            menu_quit,
+            menu_show_id,
+            menu_disconnect_id,
+            tray_rx,
+            menu_rx,
             window_visible,
             last_phase: ConnectionPhase::Idle,
             last_error: None,
@@ -159,21 +207,26 @@ impl UiApp {
     }
 
     fn poll_tray(&mut self, ctx: &egui::Context) {
-        while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-            if let TrayIconEvent::DoubleClick { .. } | TrayIconEvent::Click { .. } = event {
-                self.show_window(ctx);
+        while let Ok(event) = self.tray_rx.try_recv() {
+            match event {
+                TrayIconEvent::DoubleClick {
+                    button: tray_icon::MouseButton::Left,
+                    ..
+                }
+                | TrayIconEvent::Click {
+                    button: tray_icon::MouseButton::Left,
+                    ..
+                } => self.show_window(ctx),
+                _ => {}
             }
         }
-        while let Ok(event) = MenuEvent::receiver().try_recv() {
-            if event.id == self.menu_show.id() {
+        // Menu actions are primarily handled in set_event_handler; keep this as
+        // a fallback for Show/Disconnect if the callback only forwarded.
+        while let Ok(event) = self.menu_rx.try_recv() {
+            if event.id == self.menu_show_id {
                 self.show_window(ctx);
-            } else if event.id == self.menu_disconnect.id() {
+            } else if event.id == self.menu_disconnect_id {
                 self.session.send(Command::Disconnect);
-            } else if event.id == self.menu_quit.id() {
-                self.session.send(Command::Quit);
-                ctx.send_viewport_cmd(ViewportCommand::Close);
-                // Force exit even if close-to-tray is active.
-                std::process::exit(0);
             }
         }
     }
@@ -181,7 +234,9 @@ impl UiApp {
     fn show_window(&self, ctx: &egui::Context) {
         self.window_visible.store(true, Ordering::SeqCst);
         ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(ViewportCommand::Focus);
+        ctx.request_repaint();
     }
 
     fn hide_window(&self, ctx: &egui::Context) {
@@ -226,7 +281,7 @@ impl UiApp {
 }
 
 impl eframe::App for UiApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_tray(ctx);
 
         if ctx.input(|i| i.viewport().close_requested()) {
@@ -245,7 +300,16 @@ impl eframe::App for UiApp {
             self.session.send(Command::Connect(addr));
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        // Keep UI responsive while scanning / connected (skip when hidden to save CPU).
+        if self.window_visible.load(Ordering::SeqCst) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let state = self.snapshot();
+
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("Switch 2 Pro Controller");
             ui.separator();
 
@@ -259,7 +323,7 @@ impl eframe::App for UiApp {
                 };
                 let label = match state.phase {
                     ConnectionPhase::Scanning | ConnectionPhase::Connecting => {
-                        let n = ((ctx.input(|i| i.time) * 2.0) as usize) % 4;
+                        let n = ((ui.input(|i| i.time) * 2.0) as usize) % 4;
                         format!("{}{}", state.phase.label(), ".".repeat(n))
                     }
                     _ => state.phase.label().to_string(),
@@ -372,12 +436,9 @@ impl eframe::App for UiApp {
             ui.add_space(8.0);
             ui.colored_label(MUTED, "Close window to hide to tray.");
         });
-
-        // Keep UI responsive while scanning / connected.
-        ctx.request_repaint_after(std::time::Duration::from_millis(50));
     }
 
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    fn on_exit(&mut self) {
         self.session.send(Command::Quit);
         self.tray.take();
     }

@@ -7,8 +7,8 @@ license = "MIT"
 
 [dependencies]
 switch2-procon = { path = "../switch2-procon" }
-eframe = { version = "0.31", default-features = true }
-egui = "0.31"
-tray-icon = "0.19"
+eframe = { version = "0.35", default-features = true }
+egui = "0.35"
+tray-icon = "0.24"
 open = "5"
 notify-rust = "4"
